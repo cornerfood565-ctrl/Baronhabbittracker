@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { getSupabase, isSupabaseConfigured } from "@/lib/supabase";
 import {
   Activity, Award, BarChart3, CalendarDays, Check, CheckCheck, ChevronLeft,
   ChevronRight, CircleHelp, Flame, LayoutDashboard, Menu, MoreHorizontal,
@@ -32,6 +34,9 @@ export default function Home() {
   const [view, setView] = useState<View>("Overview");
   const [habits, setHabits] = useState<Habit[]>(initialHabits);
   const [ready, setReady] = useState(false);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [cloudReady, setCloudReady] = useState(false);
   const [modal, setModal] = useState(false);
   const [habitName, setHabitName] = useState("");
   const [category, setCategory] = useState("Personal");
@@ -46,7 +51,72 @@ export default function Home() {
     } catch {}
     setReady(true);
   }, []);
-  useEffect(() => { if (ready) localStorage.setItem("baron-habits-v1", JSON.stringify(habits)); }, [habits, ready]);
+
+  useEffect(() => {
+    if (!isSupabaseConfigured) return;
+    const supabase = getSupabase();
+
+    const loadCloudHabits = async (id: string) => {
+      setCloudReady(false);
+      const { data: rows, error } = await supabase
+        .from("habits")
+        .select("id, name, category, icon, color, target")
+        .eq("user_id", id)
+        .order("created_at", { ascending: true });
+      if (error) {
+        setToast("Cloud sync error: " + error.message);
+        setCloudReady(true);
+        return;
+      }
+      const { data: logs, error: logsError } = await supabase
+        .from("habit_logs")
+        .select("habit_id, completed_on")
+        .eq("user_id", id);
+      if (logsError) {
+        setToast("Could not load habit history: " + logsError.message);
+        setCloudReady(true);
+        return;
+      }
+      const completedByHabit = new Map<string, string[]>();
+      for (const log of logs ?? []) {
+        const list = completedByHabit.get(log.habit_id) ?? [];
+        list.push(log.completed_on);
+        completedByHabit.set(log.habit_id, list);
+      }
+      setHabits((rows ?? []).map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        category: row.category,
+        icon: row.icon,
+        color: row.color,
+        target: row.target,
+        completed: completedByHabit.get(row.id) ?? []
+      })));
+      setCloudReady(true);
+    };
+
+    supabase.auth.getSession().then(({ data }) => {
+      const session = data.session;
+      setUserId(session?.user.id ?? null);
+      setUserEmail(session?.user.email ?? null);
+      if (session?.user.id) loadCloudHabits(session.user.id);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUserId(session?.user.id ?? null);
+      setUserEmail(session?.user.email ?? null);
+      if (session?.user.id) {
+        window.setTimeout(() => loadCloudHabits(session.user.id), 0);
+      } else {
+        setCloudReady(false);
+      }
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (ready && !userId) localStorage.setItem("baron-habits-v1", JSON.stringify(habits));
+  }, [habits, ready, userId]);
 
   const today = todayKey();
   const done = habits.filter(h => h.completed.includes(today)).length;
@@ -58,11 +128,40 @@ export default function Home() {
     while (h.completed.includes(localDateKey(d))) { count++; d.setDate(d.getDate()-1); }
     return count;
   };
-  const toggle = (id: string) => setHabits(old => old.map(h => h.id === id ? { ...h, completed: h.completed.includes(today) ? h.completed.filter(x => x !== today) : [...h.completed, today] } : h));
-  const addHabit = (e: React.FormEvent) => {
-    e.preventDefault(); if (!habitName.trim()) return;
-    setHabits(old => [...old, { id: crypto.randomUUID(), name: habitName.trim(), category, icon: category === "Health" ? "🌿" : category === "Study" ? "📖" : category === "Learning" ? "💡" : "✦", color: "#aab4bf", completed: [], target: 1 }]);
-    setHabitName(""); setModal(false); setToast("Habit created"); setTimeout(() => setToast(""), 2200);
+  const toggle = async (id: string) => {
+    const habit = habits.find(h => h.id === id);
+    if (!habit) return;
+    const wasCompleted = habit.completed.includes(today);
+    setHabits(old => old.map(h => h.id === id ? { ...h, completed: wasCompleted ? h.completed.filter(x => x !== today) : [...h.completed, today] } : h));
+    if (userId && cloudReady) {
+      const supabase = getSupabase();
+      const result = wasCompleted
+        ? await supabase.from("habit_logs").delete().eq("habit_id", id).eq("user_id", userId).eq("completed_on", today)
+        : await supabase.from("habit_logs").insert({ habit_id: id, user_id: userId, completed_on: today });
+      if (result.error) setToast("Cloud save failed: " + result.error.message);
+    }
+  };
+
+  const addHabit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!habitName.trim()) return;
+    const newHabit = { id: crypto.randomUUID(), name: habitName.trim(), category, icon: category === "Health" ? "🌿" : category === "Study" ? "📖" : category === "Learning" ? "💡" : "✦", color: "#aab4bf", completed: [] as string[], target: 1 };
+    if (userId && cloudReady) {
+      const { data, error } = await getSupabase().from("habits").insert({
+        user_id: userId, name: newHabit.name, category: newHabit.category,
+        icon: newHabit.icon, color: newHabit.color, target: newHabit.target
+      }).select("id").single();
+      if (error) {
+        setToast("Could not save habit: " + error.message);
+        return;
+      }
+      newHabit.id = data.id;
+    }
+    setHabits(old => [...old, newHabit]);
+    setHabitName("");
+    setModal(false);
+    setToast(userId ? "Habit saved to your cloud account" : "Habit created on this device");
+    setTimeout(() => setToast(""), 2600);
   };
   const monthDays = useMemo(() => {
     const first = new Date(month.getFullYear(), month.getMonth(), 1);
@@ -103,7 +202,11 @@ export default function Home() {
       <main className="main-content ml-[248px] min-h-screen px-10 py-8">
         <header className="mb-9 flex flex-wrap items-center justify-between gap-4">
           <div><div className="mb-2 text-xs font-medium text-[#8c96a1]">{dateLabel}</div><h1 className="text-2xl font-semibold tracking-tight">{view === "Overview" ? "Your daily overview" : view}</h1><p className="mt-1 text-sm text-[#8c96a1]">{view === "Overview" ? "A little progress each day adds up." : "Your habits, your pace, your progress."}</p></div>
-          <div className="flex items-center gap-2"><button className="ghost-btn" onClick={()=>setToast("You're all caught up")}><CircleHelp size={15}/> Help</button><button className="primary-btn" onClick={()=>setModal(true)}><Plus size={16}/> New habit</button></div>
+          <div className="flex items-center gap-2">
+            {userId ? <button className="ghost-btn" onClick={async()=>{await getSupabase().auth.signOut();setUserId(null);setUserEmail(null);setToast("Signed out");}} title={userEmail ?? "Account"}>{userEmail ? userEmail.split("@")[0] : "Account"} · Sign out</button> : <Link className="ghost-btn" href="/auth">{isSupabaseConfigured ? "Sign in" : "Connect account"}</Link>}
+            <button className="ghost-btn" onClick={()=>setToast(userId ? (cloudReady ? "Cloud sync is active" : "Syncing your habits...") : "Your habits are saved on this device")}><CircleHelp size={15}/> Help</button>
+            <button className="primary-btn" onClick={()=>setModal(true)}><Plus size={16}/> New habit</button>
+          </div>
         </header>
 
         {view === "Overview" && <>
